@@ -17,18 +17,21 @@ from pydantic import BaseModel
 OPENSORA_DIR = Path(os.getenv("OPENSORA_DIR", "/opt/Open-Sora"))
 sys.path.insert(0, str(OPENSORA_DIR))
 
-from opensora.datasets.dataloader import prepare_dataloader
-from opensora.datasets.utils import save_video
-from opensora.models.diffusion import prepare_models, prepare_api
-from opensora.models.diffusion.sampling import SamplingOption, sanitize_sampling_option
-from opensora.utils.config import parse_configs
+from opensora.datasets import save_sample
+from opensora.utils.config import read_config, parse_alias
+from opensora.utils.sampling import (
+    SamplingOption,
+    prepare_api,
+    prepare_models,
+    sanitize_sampling_option,
+)
 
 app = FastAPI(title="Open-Sora Video Generation API")
 
 # Configuration
 DB_PATH = Path(__file__).parent / "jobs.db"
 OUTPUT_DIR = Path(__file__).parent / "outputs"
-OPENSORA_CONFIG = os.getenv("OPENSORA_CONFIG", "configs/diffusion/inference/t2i2v_256px.py")
+OPENSORA_CONFIG = os.getenv("OPENSORA_CONFIG", "configs/diffusion/inference/256px.py")
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -54,11 +57,12 @@ def load_models():
 
     # Parse config
     config_path = OPENSORA_DIR / OPENSORA_CONFIG
-    cfg = parse_configs([str(config_path)])
+    cfg = read_config(str(config_path))
+    cfg = parse_alias(cfg)
 
     # Setup device and dtype
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     # Load models
     model, model_ae, model_t5, model_clip, optional_models = prepare_models(
@@ -168,7 +172,7 @@ def process_video_job(job_id: str):
             ("in_progress", 10, job_id),
         )
 
-    output_path = OUTPUT_DIR / f"{job_id}.mp4"
+    output_path = OUTPUT_DIR / job_id
     num_frames = seconds * fps
 
     try:
@@ -188,18 +192,29 @@ def process_video_job(job_id: str):
             # Parse resolution
             width, height = map(int, size.split("x"))
 
+            # Determine aspect ratio from dimensions
+            if width > height:
+                aspect_ratio = "16:9"
+            elif height > width:
+                aspect_ratio = "9:16"
+            else:
+                aspect_ratio = "1:1"
+
             # Setup sampling options
             sampling_option = SamplingOption(
+                resolution=cfg.sampling_option.get("resolution", "256px"),
+                aspect_ratio=aspect_ratio,
                 num_frames=num_frames,
-                fps=fps,
-                height=height,
-                width=width,
+                num_steps=cfg.sampling_option.get("num_steps", 50),
+                guidance=cfg.sampling_option.get("guidance", 7.5),
+                shift=cfg.sampling_option.get("shift", True),
+                temporal_reduction=cfg.sampling_option.get("temporal_reduction", 4),
+                is_causal_vae=cfg.sampling_option.get("is_causal_vae", True),
             )
-            sampling_option = sanitize_sampling_option(sampling_option, cfg)
+            sampling_option = sanitize_sampling_option(sampling_option)
 
             # Generate video
             seed = int(time.time()) % 2**32
-            batch = {"text": [prompt]}
 
             with get_db() as conn:
                 conn.execute(
@@ -212,7 +227,8 @@ def process_video_job(job_id: str):
                 sampling_option,
                 cond_type="t2v",
                 seed=seed,
-                **batch,
+                text=[prompt],
+                channel=cfg.model.get("in_channels", 64),
             )
 
             with get_db() as conn:
@@ -221,13 +237,13 @@ def process_video_job(job_id: str):
                     (80, job_id),
                 )
 
-            # Save video
-            save_video(video_tensor[0], str(output_path), fps=fps)
+            # Save video - save_sample adds .mp4 extension
+            saved_path = save_sample(video_tensor[0], save_path=str(output_path), fps=fps)
 
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, progress = ?, completed_at = ?, file_path = ? WHERE id = ?",
-                ("completed", 100, int(time.time()), str(output_path), job_id),
+                ("completed", 100, int(time.time()), saved_path, job_id),
             )
 
     except Exception as e:
