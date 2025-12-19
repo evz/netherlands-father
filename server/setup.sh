@@ -22,11 +22,6 @@ echo "GPU detected:"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo ""
 
-# Install system dependencies
-echo "=== Installing system dependencies ==="
-sudo apt-get update
-sudo apt-get install -y git python3.10 python3.10-venv python3-pip ffmpeg
-
 # Clone Open-Sora if not exists
 if [ ! -d "$INSTALL_DIR" ]; then
     echo "=== Cloning Open-Sora ==="
