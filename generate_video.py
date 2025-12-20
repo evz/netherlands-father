@@ -47,12 +47,12 @@ class OpenAIVideoClient:
 
 
 class LocalVideoClient:
-    """Client for local Open-Sora server."""
+    """Client for local SANA-Video server."""
 
     def __init__(self, server_url: str):
         self.server_url = server_url.rstrip("/")
 
-    def generate(self, prompt: str, seconds: int = 4, resolution: str = "1280x720", fps: int = 24) -> bytes:
+    def generate(self, prompt: str, seconds: int = 4, resolution: str = "832x480", fps: int = 16) -> bytes:
         print(f"Submitting video generation request to {self.server_url}...")
 
         response = requests.post(
@@ -113,22 +113,22 @@ def save_video(content: bytes, output_path: str | None = None) -> str:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate videos using Sora or Open-Sora")
+    parser = argparse.ArgumentParser(description="Generate videos using Sora or SANA-Video")
     parser.add_argument("prompt", nargs="?", help="Video prompt")
     parser.add_argument("-f", "--file", help="Read prompt from file")
     parser.add_argument("-d", "--duration", type=int, default=4,
                         help="Video duration in seconds (default: 4)")
-    parser.add_argument("-r", "--resolution", default="1280x720",
-                        help="Output resolution (default: 1280x720)")
-    parser.add_argument("--fps", type=int, default=24,
-                        help="Frames per second (default: 24, local only)")
+    parser.add_argument("-r", "--resolution", default="832x480",
+                        help="Output resolution (default: 832x480 for SANA-Video, 1280x720 for OpenAI)")
+    parser.add_argument("--fps", type=int, default=16,
+                        help="Frames per second (default: 16 for SANA-Video, local only)")
     parser.add_argument("-o", "--output", help="Output filename")
     parser.add_argument("--fetch", metavar="VIDEO_ID", help="Fetch existing video by ID")
 
     # Backend selection
     parser.add_argument("--local", action="store_true",
-                        help="Use local Open-Sora server instead of OpenAI")
-    parser.add_argument("--server", default=os.getenv("OPENSORA_SERVER", "http://localhost:8000"),
+                        help="Use local SANA-Video server instead of OpenAI")
+    parser.add_argument("--server", default=os.getenv("SANA_SERVER", os.getenv("OPENSORA_SERVER", "http://localhost:8000")),
                         help="Local server URL (default: http://localhost:8000)")
 
     args = parser.parse_args()

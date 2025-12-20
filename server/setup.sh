@@ -37,7 +37,7 @@ fi
 echo "=== Setting up Python environment ==="
 cd "$INSTALL_DIR"
 if [ ! -d "venv" ]; then
-    python3.10 -m venv venv
+    python3 -m venv venv
 fi
 source venv/bin/activate
 

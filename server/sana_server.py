@@ -1,84 +1,32 @@
 import os
 import sqlite3
+import subprocess
 import sys
-import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-import torch
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# Add Open-Sora to path before importing
-OPENSORA_DIR = Path(os.getenv("OPENSORA_DIR", "/opt/Open-Sora"))
-sys.path.insert(0, str(OPENSORA_DIR))
+# SANA directory
+SANA_DIR = Path(os.getenv("SANA_DIR", "/opt/Sana"))
 
-from opensora.datasets import save_sample
-from opensora.utils.config import read_config, parse_alias
-from opensora.utils.sampling import (
-    SamplingOption,
-    prepare_api,
-    prepare_models,
-    sanitize_sampling_option,
-)
-
-app = FastAPI(title="Open-Sora Video Generation API")
+app = FastAPI(title="SANA-Video Generation API")
 
 # Configuration
 DB_PATH = Path(__file__).parent / "jobs.db"
 OUTPUT_DIR = Path(__file__).parent / "outputs"
-OPENSORA_CONFIG = os.getenv("OPENSORA_CONFIG", "configs/diffusion/inference/256px.py")
+INFERENCE_SCRIPT = Path(__file__).parent / "sana_inference.py"
+# SANA model ID from HuggingFace
+SANA_MODEL_ID = os.getenv("SANA_MODEL_ID", "Efficient-Large-Model/SANA-Video_2B_480p_diffusers")
+# Python executable (use the one from venv if available)
+PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
 
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-# Global model state (loaded once at startup)
-model_state = {
-    "api_fn": None,
-    "cfg": None,
-    "device": None,
-    "dtype": None,
-    "loaded": False,
-}
-model_lock = threading.Lock()
-
-
-def load_models():
-    """Load Open-Sora models (called once at startup)."""
-    global model_state
-
-    if model_state["loaded"]:
-        return
-
-    print("Loading Open-Sora models...")
-
-    # Parse config
-    config_path = OPENSORA_DIR / OPENSORA_CONFIG
-    cfg = read_config(str(config_path))
-    cfg = parse_alias(cfg)
-
-    # Setup device and dtype
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-
-    # Load models
-    model, model_ae, model_t5, model_clip, optional_models = prepare_models(
-        cfg, device, dtype, offload_model=False
-    )
-
-    # Create API function
-    api_fn = prepare_api(model, model_ae, model_t5, model_clip, optional_models)
-
-    model_state["api_fn"] = api_fn
-    model_state["cfg"] = cfg
-    model_state["device"] = device
-    model_state["dtype"] = dtype
-    model_state["loaded"] = True
-
-    print("Models loaded successfully!")
 
 
 # Database setup
@@ -154,7 +102,7 @@ def row_to_response(row: sqlite3.Row) -> VideoResponse:
 
 # Background worker
 def process_video_job(job_id: str):
-    """Process a video generation job using Open-Sora."""
+    """Process a video generation job using SANA-Video via subprocess."""
     with get_db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if not row:
@@ -172,83 +120,116 @@ def process_video_job(job_id: str):
             ("in_progress", 10, job_id),
         )
 
-    output_path = OUTPUT_DIR / job_id
+    output_path = OUTPUT_DIR / f"{job_id}.mp4"
     num_frames = seconds * fps
 
     try:
-        with model_lock:
-            api_fn = model_state["api_fn"]
-            cfg = model_state["cfg"]
+        # Parse resolution
+        width, height = map(int, size.split("x"))
 
-            if api_fn is None:
-                raise RuntimeError("Models not loaded")
+        # Calculate motion score based on video duration (longer videos = higher motion)
+        # For 4s video use motion score 30, scale proportionally
+        motion_score = min(100, max(10, int(30 * (seconds / 4.0))))
 
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET progress = ? WHERE id = ?",
-                    (30, job_id),
-                )
+        # Build command to run inference script as subprocess
+        cmd = [
+            PYTHON_BIN,
+            str(INFERENCE_SCRIPT),
+            "--prompt", prompt,
+            "--output", str(output_path),
+            "--model-id", SANA_MODEL_ID,
+            "--height", str(height),
+            "--width", str(width),
+            "--frames", str(num_frames),
+            "--fps", str(fps),
+            "--motion-score", str(motion_score),
+        ]
 
-            # Parse resolution
-            width, height = map(int, size.split("x"))
-
-            # Determine aspect ratio from dimensions
-            if width > height:
-                aspect_ratio = "16:9"
-            elif height > width:
-                aspect_ratio = "9:16"
-            else:
-                aspect_ratio = "1:1"
-
-            # Setup sampling options
-            sampling_option = SamplingOption(
-                resolution=cfg.sampling_option.get("resolution", "256px"),
-                aspect_ratio=aspect_ratio,
-                num_frames=num_frames,
-                num_steps=cfg.sampling_option.get("num_steps", 50),
-                guidance=cfg.sampling_option.get("guidance", 7.5),
-                shift=cfg.sampling_option.get("shift", True),
-                temporal_reduction=cfg.sampling_option.get("temporal_reduction", 4),
-                is_causal_vae=cfg.sampling_option.get("is_causal_vae", True),
-            )
-            sampling_option = sanitize_sampling_option(sampling_option)
-
-            # Generate video
-            seed = int(time.time()) % 2**32
-
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET progress = ? WHERE id = ?",
-                    (50, job_id),
-                )
-
-            # Run inference
-            video_tensor = api_fn(
-                sampling_option,
-                cond_type="t2v",
-                seed=seed,
-                text=[prompt],
-                channel=cfg.model.get("in_channels", 64),
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET progress = ? WHERE id = ?",
+                (30, job_id),
             )
 
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET progress = ? WHERE id = ?",
-                    (80, job_id),
-                )
+        # Run inference in subprocess
+        print(f"[INFO] Running inference subprocess for job {job_id}")
+        print(f"[INFO] Command: {' '.join(cmd)}")
 
-            # Save video - save_sample adds .mp4 extension
-            saved_path = save_sample(video_tensor[0], save_path=str(output_path), fps=fps)
+        env = os.environ.copy()
+        env["SANA_DIR"] = str(SANA_DIR)
+
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Stream output and update progress
+        stdout_lines = []
+        stderr_lines = []
+
+        while True:
+            # Read stdout
+            stdout_line = process.stdout.readline()
+            if stdout_line:
+                print(stdout_line.rstrip())
+                stdout_lines.append(stdout_line)
+
+                # Update progress based on log messages
+                if "Models loaded successfully" in stdout_line or "Loading SANA-Video pipeline" in stdout_line:
+                    with get_db() as conn:
+                        conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (50, job_id))
+                elif "Starting inference" in stdout_line:
+                    with get_db() as conn:
+                        conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (60, job_id))
+                elif "Inference completed" in stdout_line:
+                    with get_db() as conn:
+                        conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (80, job_id))
+                elif "Saving video" in stdout_line:
+                    with get_db() as conn:
+                        conn.execute("UPDATE jobs SET progress = ? WHERE id = ?", (90, job_id))
+
+            # Check if process finished
+            if process.poll() is not None:
+                # Read remaining output
+                remaining_stdout = process.stdout.read()
+                if remaining_stdout:
+                    print(remaining_stdout.rstrip())
+                    stdout_lines.append(remaining_stdout)
+                break
+
+        # Read any stderr
+        stderr = process.stderr.read()
+        if stderr:
+            print(f"[STDERR]\n{stderr}", file=sys.stderr)
+            stderr_lines.append(stderr)
+
+        returncode = process.returncode
+
+        if returncode != 0:
+            error_msg = f"Inference failed with exit code {returncode}"
+            if stderr_lines:
+                error_msg += f"\n{stderr}"
+            raise RuntimeError(error_msg)
+
+        # Check if the video file was created
+        if not Path(output_path).exists():
+            raise RuntimeError(f"Video file not found at {output_path}")
 
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, progress = ?, completed_at = ?, file_path = ? WHERE id = ?",
-                ("completed", 100, int(time.time()), saved_path, job_id),
+                ("completed", 100, int(time.time()), str(output_path), job_id),
             )
+
+        print(f"[INFO] Job {job_id} completed successfully")
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, error = ? WHERE id = ?",
@@ -357,7 +338,8 @@ def delete_video(video_id: str):
 @app.on_event("startup")
 def startup():
     init_db()
-    load_models()
+    print("[INFO] SANA-Video server started. Video generation will run in isolated subprocesses.")
+    print(f"[INFO] Using model: {SANA_MODEL_ID}")
 
 
 if __name__ == "__main__":
